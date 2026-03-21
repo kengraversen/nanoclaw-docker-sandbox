@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw",
-  "version": "1.2.12",
+  "version": "1.2.14",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -28,6 +28,7 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "yaml": "^2.8.2",
+    "@slack/bolt": "^4.6.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
