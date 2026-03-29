@@ -1,7 +1,7 @@
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation
 
-FROM node:22-slim
+FROM node:24-slim
 
 # Accept proxy build args and configure npm to work through MITM proxies
 ARG http_proxy
