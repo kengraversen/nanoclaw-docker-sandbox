@@ -9,6 +9,7 @@ vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Jonesy',
   TRIGGER_PATTERN: /^@Jonesy\b/i,
+  GROUPS_DIR: '/tmp/nanoclaw-test-groups',
 }));
 
 // Mock logger
@@ -25,6 +26,23 @@ vi.mock('../logger.js', () => ({
 vi.mock('../db.js', () => ({
   updateChatName: vi.fn(),
 }));
+
+// Mock fs (only the functions used by file download)
+const fsMocks = vi.hoisted(() => ({
+  mkdirSync: vi.fn(),
+  writeFileSync: vi.fn(),
+}));
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      mkdirSync: fsMocks.mkdirSync,
+      writeFileSync: fsMocks.writeFileSync,
+    },
+  };
+});
 
 // --- @slack/bolt mock ---
 
@@ -115,6 +133,13 @@ function createMessageEvent(overrides: {
   threadTs?: string;
   subtype?: string;
   botId?: string;
+  files?: Array<{
+    id: string;
+    name: string;
+    mimetype: string;
+    size: number;
+    url_private_download?: string;
+  }>;
 }) {
   return {
     channel: overrides.channel ?? 'C0123456789',
@@ -125,6 +150,7 @@ function createMessageEvent(overrides: {
     thread_ts: overrides.threadTs,
     subtype: overrides.subtype,
     bot_id: overrides.botId,
+    files: overrides.files,
   };
 }
 
@@ -132,7 +158,9 @@ function currentApp() {
   return appRef.current;
 }
 
-async function triggerMessageEvent(event: ReturnType<typeof createMessageEvent>) {
+async function triggerMessageEvent(
+  event: ReturnType<typeof createMessageEvent>,
+) {
   const handler = currentApp().eventHandlers.get('message');
   if (handler) await handler({ event });
 }
@@ -270,7 +298,7 @@ describe('SlackChannel', () => {
       expect(opts.onChatMetadata).toHaveBeenCalled();
     });
 
-    it('skips messages with no text', async () => {
+    it('skips messages with no text and no files', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
@@ -309,7 +337,10 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      const event = createMessageEvent({ user: 'U_BOT_123', text: 'Self message' });
+      const event = createMessageEvent({
+        user: 'U_BOT_123',
+        text: 'Self message',
+      });
       await triggerMessageEvent(event);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -391,13 +422,17 @@ describe('SlackChannel', () => {
       await channel.connect();
 
       // First message — API call
-      await triggerMessageEvent(createMessageEvent({ user: 'U_USER_456', text: 'First' }));
+      await triggerMessageEvent(
+        createMessageEvent({ user: 'U_USER_456', text: 'First' }),
+      );
       // Second message — should use cache
-      await triggerMessageEvent(createMessageEvent({
-        user: 'U_USER_456',
-        text: 'Second',
-        ts: '1704067201.000000',
-      }));
+      await triggerMessageEvent(
+        createMessageEvent({
+          user: 'U_USER_456',
+          text: 'Second',
+          ts: '1704067201.000000',
+        }),
+      );
 
       expect(currentApp().client.users.info).toHaveBeenCalledTimes(1);
     });
@@ -407,7 +442,9 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      currentApp().client.users.info.mockRejectedValueOnce(new Error('API error'));
+      currentApp().client.users.info.mockRejectedValueOnce(
+        new Error('API error'),
+      );
 
       const event = createMessageEvent({ user: 'U_UNKNOWN', text: 'Hi' });
       await triggerMessageEvent(event);
@@ -812,17 +849,13 @@ describe('SlackChannel', () => {
       const channel = new SlackChannel(opts);
 
       // First page returns a cursor; second page returns no cursor
-      currentApp().client.conversations.list
-        .mockResolvedValueOnce({
-          channels: [
-            { id: 'C001', name: 'general', is_member: true },
-          ],
+      currentApp()
+        .client.conversations.list.mockResolvedValueOnce({
+          channels: [{ id: 'C001', name: 'general', is_member: true }],
           response_metadata: { next_cursor: 'cursor_page2' },
         })
         .mockResolvedValueOnce({
-          channels: [
-            { id: 'C002', name: 'random', is_member: true },
-          ],
+          channels: [{ id: 'C002', name: 'random', is_member: true }],
           response_metadata: {},
         });
 
@@ -830,7 +863,8 @@ describe('SlackChannel', () => {
 
       // Should have called conversations.list twice (once per page)
       expect(currentApp().client.conversations.list).toHaveBeenCalledTimes(2);
-      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(2,
+      expect(currentApp().client.conversations.list).toHaveBeenNthCalledWith(
+        2,
         expect.objectContaining({ cursor: 'cursor_page2' }),
       );
 
@@ -846,6 +880,146 @@ describe('SlackChannel', () => {
     it('has name "slack"', () => {
       const channel = new SlackChannel(createTestOpts());
       expect(channel.name).toBe('slack');
+    });
+  });
+
+  // --- File attachment handling ---
+
+  describe('file attachment handling', () => {
+    it('delivers file-only messages (no text)', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Mock fetch for file download
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(100)),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const event = createMessageEvent({
+        text: undefined as any,
+        files: [
+          {
+            id: 'F001',
+            name: 'test.zip',
+            mimetype: 'application/zip',
+            size: 1024,
+            url_private_download: 'https://files.slack.com/test.zip',
+          },
+        ],
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          content: expect.stringContaining('[File: test.zip'),
+        }),
+      );
+
+      // Verify file was downloaded with bot token
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://files.slack.com/test.zip',
+        expect.objectContaining({
+          headers: { Authorization: 'Bearer xoxb-test-token' },
+        }),
+      );
+
+      vi.unstubAllGlobals();
+    });
+
+    it('includes both text and file annotations', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        arrayBuffer: () => Promise.resolve(new ArrayBuffer(50)),
+      }));
+
+      const event = createMessageEvent({
+        text: 'Check this file',
+        files: [
+          {
+            id: 'F002',
+            name: 'data.csv',
+            mimetype: 'text/csv',
+            size: 500,
+            url_private_download: 'https://files.slack.com/data.csv',
+          },
+        ],
+      });
+      await triggerMessageEvent(event);
+
+      const call = vi.mocked(opts.onMessage).mock.calls[0];
+      expect(call[1].content).toContain('Check this file');
+      expect(call[1].content).toContain('[File: data.csv');
+
+      vi.unstubAllGlobals();
+    });
+
+    it('skips files exceeding size limit', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        text: 'Huge file',
+        files: [
+          {
+            id: 'F003',
+            name: 'huge.bin',
+            mimetype: 'application/octet-stream',
+            size: 100 * 1024 * 1024, // 100MB
+            url_private_download: 'https://files.slack.com/huge.bin',
+          },
+        ],
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          content: expect.stringContaining('skipped, exceeds'),
+        }),
+      );
+    });
+
+    it('handles download failures gracefully', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+      }));
+
+      const event = createMessageEvent({
+        text: 'A file',
+        files: [
+          {
+            id: 'F004',
+            name: 'secret.pdf',
+            mimetype: 'application/pdf',
+            size: 2048,
+            url_private_download: 'https://files.slack.com/secret.pdf',
+          },
+        ],
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          content: expect.stringContaining('download failed'),
+        }),
+      );
+
+      vi.unstubAllGlobals();
     });
   });
 });

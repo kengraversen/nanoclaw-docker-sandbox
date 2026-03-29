@@ -1,7 +1,11 @@
+import fs from 'fs';
+import path from 'path';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -22,6 +26,17 @@ const MAX_MESSAGE_LENGTH = 4000;
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
 
+// Max file size we'll download (50 MB)
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+
+interface SlackFile {
+  id: string;
+  name: string;
+  mimetype: string;
+  size: number;
+  url_private_download?: string;
+}
+
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -32,6 +47,7 @@ export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private botToken: string;
   private botUserId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
@@ -55,11 +71,17 @@ export class SlackChannel implements Channel {
       );
     }
 
+    this.botToken = botToken;
+
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy;
+    const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
+
     this.app = new App({
       token: botToken,
       appToken,
       socketMode: true,
       logLevel: LogLevel.ERROR,
+      ...(agent && { agent }),
     });
 
     this.setupEventHandlers();
@@ -72,12 +94,17 @@ export class SlackChannel implements Channel {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
-      if (subtype && subtype !== 'bot_message') return;
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
 
-      if (!msg.text) return;
+      // Check for file attachments
+      const files = (msg as any).files as SlackFile[] | undefined;
+      const hasFiles = files && files.length > 0;
+
+      // Skip messages with neither text nor files
+      if (!msg.text && !hasFiles) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -94,8 +121,7 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
@@ -107,15 +133,30 @@ export class SlackChannel implements Channel {
           'unknown';
       }
 
+      // Download file attachments to the group's attachments directory
+      let fileAnnotations = '';
+      if (hasFiles && !isBotMessage) {
+        const groupFolder = groups[jid].folder;
+        fileAnnotations = await this.downloadFiles(files, groupFolder);
+      }
+
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
-      if (this.botUserId && !isBotMessage) {
+      let content = msg.text || '';
+      if (this.botUserId && !isBotMessage && content) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
+      }
+
+      // Append file annotations to the message content
+      if (fileAnnotations) {
+        content = (content ? content + '\n' : '') + fileAnnotations;
       }
 
       this.opts.onMessage(jid, {
@@ -142,10 +183,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -245,9 +283,94 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  /**
+   * Download Slack file attachments to the group's attachments directory.
+   * Returns annotation text describing the downloaded files for the agent.
+   */
+  private async downloadFiles(
+    files: SlackFile[],
+    groupFolder: string,
+  ): Promise<string> {
+    const attachmentsDir = path.join(GROUPS_DIR, groupFolder, 'attachments');
+    fs.mkdirSync(attachmentsDir, { recursive: true });
+
+    const annotations: string[] = [];
+
+    for (const file of files) {
+      // Sanitize filename: remove path separators and null bytes
+      const safeName = file.name.replace(/[/\\:\0]/g, '_');
+
+      if (!file.url_private_download) {
+        annotations.push(
+          `[File: ${safeName} (${file.mimetype}, ${file.size} bytes) — no download URL available]`,
+        );
+        continue;
+      }
+
+      if (file.size > MAX_FILE_SIZE) {
+        annotations.push(
+          `[File: ${safeName} (${file.mimetype}, ${file.size} bytes) — skipped, exceeds ${MAX_FILE_SIZE / 1024 / 1024}MB limit]`,
+        );
+        continue;
+      }
+
+      try {
+        // Use Slack's files.info API to get a fresh download URL, then
+        // download with the bot token. The url_private_download from the
+        // event payload may redirect to a login page without proper auth.
+        const fileInfo = await this.app.client.files.info({ file: file.id });
+        const downloadUrl =
+          (fileInfo.file as any)?.url_private_download ||
+          file.url_private_download;
+
+        const response = await fetch(downloadUrl, {
+          headers: { Authorization: `Bearer ${this.botToken}` },
+          redirect: 'follow',
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+
+        // Verify we got actual file content, not an HTML login page
+        const contentType = response.headers.get('content-type') || '';
+        if (
+          contentType.includes('text/html') &&
+          !file.mimetype.includes('html')
+        ) {
+          throw new Error(
+            'Slack returned HTML instead of the file — bot may lack files:read scope',
+          );
+        }
+
+        // Prefix with timestamp to avoid collisions
+        const timestamp = Date.now();
+        const destName = `${timestamp}_${safeName}`;
+        const destPath = path.join(attachmentsDir, destName);
+        fs.writeFileSync(destPath, buffer);
+
+        logger.info(
+          { file: safeName, size: buffer.length, dest: destPath },
+          'Slack file downloaded',
+        );
+
+        annotations.push(
+          `[File: ${safeName} (${file.mimetype}, ${buffer.length} bytes) saved to /workspace/group/attachments/${destName}]`,
+        );
+      } catch (err) {
+        logger.warn({ file: safeName, err }, 'Failed to download Slack file');
+        annotations.push(
+          `[File: ${safeName} (${file.mimetype}, ${file.size} bytes) — download failed: ${(err as Error).message}]`,
+        );
+      }
+    }
+
+    return annotations.join('\n');
+  }
+
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);

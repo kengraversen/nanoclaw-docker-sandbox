@@ -19,6 +19,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@slack/bolt": "^4.6.0",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
@@ -28,7 +29,6 @@
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "yaml": "^2.8.2",
-    "@slack/bolt": "^4.6.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
