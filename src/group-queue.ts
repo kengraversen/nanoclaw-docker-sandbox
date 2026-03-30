@@ -344,22 +344,64 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [_jid, state] of this.groups) {
+    // Send _close sentinel to all active containers so Claude Code can flush
+    // auto-memory and session data to disk before the process exits.
+    const activeEntries: Array<{
+      jid: string;
+      containerName: string;
+      process: ChildProcess;
+    }> = [];
+    for (const [jid, state] of this.groups) {
       if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+        activeEntries.push({
+          jid,
+          containerName: state.containerName,
+          process: state.process,
+        });
+        // Signal graceful shutdown via IPC
+        this.closeStdin(jid);
       }
     }
 
+    if (activeEntries.length === 0) {
+      logger.info('GroupQueue shutting down (no active containers)');
+      return;
+    }
+
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      {
+        activeCount: activeEntries.length,
+        containers: activeEntries.map((e) => e.containerName),
+      },
+      'GroupQueue shutting down, waiting for containers to flush memory',
+    );
+
+    // Wait for containers to exit gracefully (up to gracePeriodMs)
+    await Promise.all(
+      activeEntries.map(
+        ({ containerName, process: proc }) =>
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(() => {
+              logger.warn(
+                { containerName },
+                'Container did not exit in time during shutdown',
+              );
+              resolve();
+            }, gracePeriodMs);
+
+            proc.on('close', () => {
+              clearTimeout(timer);
+              logger.info(
+                { containerName },
+                'Container exited gracefully during shutdown',
+              );
+              resolve();
+            });
+          }),
+      ),
     );
   }
 }
