@@ -10,25 +10,24 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
-  ONECLI_URL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
-import { OneCLI } from '@onecli-sh/sdk';
+import { detectAuthMode } from './credential-proxy.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-
-const onecli = new OneCLI({ url: ONECLI_URL });
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -221,26 +220,72 @@ function buildVolumeMounts(
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
-  agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
+  // Forward proxy and CA settings so containers can reach external services
+  const caCertEnvVars = [
+    'NODE_EXTRA_CA_CERTS',
+    'SSL_CERT_FILE',
+    'REQUESTS_CA_BUNDLE',
+  ];
+  for (const envVar of [
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'no_proxy',
+    ...caCertEnvVars,
+  ]) {
+    if (process.env[envVar]) {
+      if (caCertEnvVars.includes(envVar)) {
+        args.push('-e', `${envVar}=/workspace/ca-cert/proxy-ca.crt`);
+      } else if (envVar === 'NO_PROXY' || envVar === 'no_proxy') {
+        const val = process.env[envVar];
+        const extra = val
+          ? `${val},host.docker.internal`
+          : 'host.docker.internal';
+        args.push('-e', `${envVar}=${extra}`);
+      } else {
+        args.push('-e', `${envVar}=${process.env[envVar]}`);
+      }
+    }
+  }
+
+  // Mount CA certificate into container if NODE_EXTRA_CA_CERTS is set.
+  const hostCaCert =
+    process.env.NODE_EXTRA_CA_CERTS || process.env.SSL_CERT_FILE;
+  if (hostCaCert && fs.existsSync(hostCaCert)) {
+    const caCertDir = path.join(DATA_DIR, 'ca-cert');
+    const caCertDst = path.join(caCertDir, 'proxy-ca.crt');
+    fs.mkdirSync(caCertDir, { recursive: true });
+    fs.copyFileSync(hostCaCert, caCertDst);
+    mounts.push({
+      hostPath: caCertDir,
+      containerPath: '/workspace/ca-cert',
+      readonly: true,
+    });
+  }
+
+  // Route API traffic through the credential proxy (containers never see real secrets)
+  args.push(
+    '-e',
+    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+  );
+
+  // Mirror the host's auth method with a placeholder value.
+  // API key mode: SDK sends x-api-key, proxy replaces with real key.
+  // OAuth mode:   SDK exchanges placeholder token for temp API key,
+  //               proxy injects real OAuth token on that exchange request.
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
-    );
+    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
   // Runtime-specific args for host gateway resolution
@@ -283,15 +328,7 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  // Main group uses the default OneCLI agent; others use their own agent.
-  const agentIdentifier = input.isMain
-    ? undefined
-    : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentIdentifier,
-  );
+  const containerArgs = await buildContainerArgs(mounts, containerName);
 
   logger.debug(
     {
