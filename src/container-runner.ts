@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -204,6 +205,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // SSH keys for git operations (read-only, dedicated mount bypasses blocklist)
+  const sshDir = path.join(os.homedir(), '.nanoclaw_ssh');
+  if (fs.existsSync(sshDir)) {
+    mounts.push({
+      hostPath: sshDir,
+      containerPath: '/home/node/.ssh',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -299,6 +310,26 @@ async function buildContainerArgs(
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
+
+    // SSH requires the running uid to exist in /etc/passwd.
+    // Generate a passwd file that maps the host uid to /home/node.
+    const passwdFile = path.join(DATA_DIR, 'container-passwd');
+    if (!fs.existsSync(passwdFile)) {
+      fs.mkdirSync(path.dirname(passwdFile), { recursive: true });
+      fs.writeFileSync(
+        passwdFile,
+        [
+          'root:x:0:0:root:/root:/bin/bash',
+          `node:x:${hostUid}:${hostGid}:node:/home/node:/bin/bash`,
+          'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin',
+        ].join('\n') + '\n',
+      );
+    }
+    mounts.push({
+      hostPath: passwdFile,
+      containerPath: '/etc/passwd',
+      readonly: true,
+    });
   }
 
   for (const mount of mounts) {
