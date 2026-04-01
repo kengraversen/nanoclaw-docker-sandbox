@@ -23,6 +23,14 @@ done
 
 ${CONTAINER_RUNTIME} build $PROXY_ARGS -t "${IMAGE_NAME}:${TAG}" .
 
+# Stop running agent containers so they pick up the new image on next message
+RUNNING=$(${CONTAINER_RUNTIME} ps -q --filter "name=nanoclaw-" 2>/dev/null)
+if [ -n "$RUNNING" ]; then
+  echo ""
+  echo "Stopping running agent containers..."
+  ${CONTAINER_RUNTIME} stop $RUNNING 2>/dev/null || true
+fi
+
 echo ""
 echo "Build complete!"
 echo "Image: ${IMAGE_NAME}:${TAG}"

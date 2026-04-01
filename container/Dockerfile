@@ -1,7 +1,7 @@
 # NanoClaw Agent Container
 # Runs Claude Agent SDK in isolated Linux VM with browser automation
 
-FROM node:24-slim
+FROM node:22-slim
 
 # Accept proxy build args and configure npm to work through MITM proxies
 ARG http_proxy
@@ -30,7 +30,27 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    gnupg \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
+
+# Install PHP 8.4 from Sury repository (Bookworm ships 8.2, too old for project deps)
+RUN curl -sSL https://packages.sury.org/php/apt.gpg | gpg --dearmor -o /usr/share/keyrings/sury-php.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://packages.sury.org/php/ bookworm main" > /etc/apt/sources.list.d/sury-php.list \
+    && apt-get update && apt-get install -y \
+    php8.4-cli \
+    php8.4-mbstring \
+    php8.4-xml \
+    php8.4-curl \
+    php8.4-sqlite3 \
+    php8.4-zip \
+    php8.4-intl \
+    php8.4-bcmath \
+    php8.4-gd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Composer
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
